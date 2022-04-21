@@ -33,7 +33,7 @@ void RtiTask::run() {
     QString err;
 	for(auto step: steps) {
         if (step == "dstretch")
-            dstretchSet(input_folder, output, 1000, callback);
+            dstretchSet(input_folder, output, 500, callback);
 		if(step == "relight")
 			relight();
 		else if(step == "toRTI")

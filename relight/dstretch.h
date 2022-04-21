@@ -156,35 +156,37 @@ inline void dstretchSet(QString inputFolder, QString output, int minSamples, std
 {
     output = output.mid(0, output.lastIndexOf("/"));
     qDebug() << "SETT";
+    // Image set initialization
     ImageSet set;
+    set.setCallback(nullptr);
+    set.initFromFolder(inputFolder.toStdString().c_str());
+    int nImages = set.images.size();
+
     // Vector used to temporarily store a line of pixels
     PixelArray pixels;
     // Vector used to store samples
-    std::vector<Color3f> samples;
+    std::vector<std::vector<Color3f>> samples;
 
     // Final data to be saved
-    std::vector<std::vector<int>> dstretched;
+    std::vector<std::vector<float>> dstretched;
     std::vector<std::vector<uint8_t>> dstretchedBytes;
 
     // Size of the image
     int width, height;
     // Covariance matrix
-    Eigen::MatrixXd covariance(3, 3);
+    Eigen::MatrixXd covariance(3 * nImages, 3 * nImages);
     // Channel means
-    Eigen::VectorXd means(3);
+    Eigen::VectorXd means(nImages * 3);
 
     // Max and min values for channels (used to rescale the output)
-    int** mins, **maxs;
+    float** mins, **maxs;
 
-    set.setCallback(nullptr);
-    set.initFromFolder(inputFolder.toStdString().c_str());
-
-    mins = new int*[set.images.size()];
-    maxs = new int*[set.images.size()];
-    for (int i=0; i<set.images.size(); i++)
+    mins = new float*[nImages];
+    maxs = new float*[nImages];
+    for (int i=0; i<nImages; i++)
     {
-        mins[i] = new int[3];
-        maxs[i] = new int[3];
+        mins[i] = new float[3];
+        maxs[i] = new float[3];
 
         for (int j=0; j<3; j++)
         {
@@ -196,11 +198,12 @@ inline void dstretchSet(QString inputFolder, QString output, int minSamples, std
 
     width = set.width;
     height = set.height;
-    pixels.resize(width, set.images.size());
+    pixels.resize(width, nImages);
+    samples.resize(nImages);
     means.fill(0);
 
-    dstretched.resize(set.images.size());
-    dstretchedBytes.resize(set.images.size());
+    dstretched.resize(nImages);
+    dstretchedBytes.resize(nImages);
 
     // Compute the distances between a sample and another one so that at least minSamples are taken
     uint32_t samplesHorizontal = std::ceil(std::sqrt(minSamples) * ((float)width / height));
@@ -217,15 +220,15 @@ inline void dstretchSet(QString inputFolder, QString output, int minSamples, std
         if (row % rowSkip == 0)
         {
             // Getting the samples
-            for (int col=0; col<pixels.size(); col+=colSkip*3)
+            for (int col=0; col<pixels.size(); col+=colSkip)
             {
-                for (int l=0; l<pixels.nlights; l++)
+                for (int l=0; l<nImages; l++)
                     for (int i=0; i<3; i++)
                         // For each light we have a line, take the col pixel from that line and add the i channel
-                        means(i) += pixels[col][l][i];
+                        means(l*3 + i) += pixels[col][l][i];
 
-                for (int l=0; l<pixels.nlights; l++)
-                    samples.push_back(pixels[col][l]);
+                for (int l=0; l<nImages; l++)
+                    samples[l].push_back(pixels[col][l]);
             }
         }
 
@@ -234,26 +237,53 @@ inline void dstretchSet(QString inputFolder, QString output, int minSamples, std
     }
 
     // Compute the mean of the channels
-    for (int i=0; i<3; i++)
-        means(i) /= samples.size();
+    for (int im=0; im<samples.size(); im++)
+        for (int i=0; i<3; i++)
+            means(im*3 + i) /= samples[im].size();
 
     // Compute the sums needed to compute the covariance
-    long sumChannel[]= {0,0,0};
-    double sumX[][3] = {{0,0,0},{0,0,0},{0,0,0}};
+    // Initialize the matrices
+    std::vector<long[3]> sumChannel(nImages);
+    std::vector<std::vector<double>> sumX(nImages*3);
+    for (int i=0; i<nImages*3; i++)
+        sumX[i].resize(nImages*3);
 
-    for (int k=0; k<samples.size(); k++)
-        for (int i=0; i<3; i++)
-            sumChannel[i] += samples[k][i];
+    // Compute the channel sums
+    for (int im=0; im<nImages; im++)
+        for (int k=0; k<samples[im].size(); k++)
+            for (int i=0; i<3; i++)
+                sumChannel[im][i] += samples[im][k][i];
 
-    for (int l=0; l<3; l++)
-        for (int m=0; m<3; m++)
-            for (int k=0; k<samples.size(); k++)
-                sumX[l][m] += samples[k][l] * samples[k][m];
+    // Compute the covariance sums
+    for (int l=0; l<nImages*3; l++)
+    {
+        for (int m=0; m<nImages*3; m++)
+        {
+            int imgL = l / 3;
+            int imgM = m / 3;
+            int lChannel = l % 3;
+            int mChannel = m % 3;
+
+            for (int k=0; k<samples[imgL].size(); k++)
+                sumX[l][m] += samples[imgL][k][lChannel] * samples[imgM][k][mChannel];
+        }
+    }
 
     // Compute the covariance
-    for (int l=0; l<3; l++)
-        for (int m=0; m<3; m++)
-            covariance(l,m) = ((double)(1.0f/(samples.size() - 1))) * (sumX[l][m] - ((double)1.0f/samples.size())*sumChannel[l]*sumChannel[m]);
+    for (int l=0; l<nImages*3; l++)
+    {
+        for (int m=0; m<nImages*3; m++)
+        {
+            int imgL = l / 3;
+            int imgM = m / 3;
+
+            covariance(l,m) =   ((double)(1.0f/(samples[imgL].size() - 1))) *
+                                (sumX[l][m] - ((double)1.0f/samples[imgL].size())*sumChannel[imgL][l%3]*sumChannel[imgM][m%3]);
+
+            double sas = covariance(l,m);
+            qDebug() << sas;
+        }
+    }
 
     // Compute the rotation
     Eigen::EigenSolver<Eigen::MatrixXd> solver(covariance, true);
@@ -261,11 +291,11 @@ inline void dstretchSet(QString inputFolder, QString output, int minSamples, std
     Eigen::MatrixXd eigenValues = solver.eigenvalues().real();
 
     Eigen::MatrixXd sigma = covariance.diagonal().asDiagonal();
-    for (int i=0; i<3; i++)
+    for (int i=0; i<nImages*3; i++)
         sigma(i, i) = std::sqrt(sigma(i,i));
 
     // Compute the stretching factor
-    for (int i=0; i<3; i++)
+    for (int i=0; i<nImages*3; i++)
         eigenValues(i) = 1.0f / std::sqrt(eigenValues(i) >= 0 ? eigenValues(i) : -eigenValues(i));
 
     // Compute the final transformation matrix
@@ -274,10 +304,10 @@ inline void dstretchSet(QString inputFolder, QString output, int minSamples, std
     Eigen::VectorXd offset = means - transformation * means;
 
     // Start up the encoders
-    JpegEncoder* encoders = new JpegEncoder[set.images.size()];
+    JpegEncoder* encoders = new JpegEncoder[nImages];
 
     // Transform and scale all the images in different files
-    Eigen::VectorXd currPixel(3);
+    Eigen::VectorXd currPixel(3 * nImages);
     PixelArray line;
     set.restart();
 
@@ -286,33 +316,36 @@ inline void dstretchSet(QString inputFolder, QString output, int minSamples, std
         // Read a line
         set.readLine(line);
 
-        // Transform all the pixels of all the images, store the result in a vector tied to the right image
-        for (int im=0; im<set.images.size(); im++)
+        for (int k=0; k<line.size(); k++)
         {
-            for (int k=0; k<line.size(); k++)
+            // Create the pixel vector, that contains all the nImages pixels of the set
+            for (int l=0; l<line[k].size(); l++)
+                for (int c=0; c<3; c++)
+                    currPixel(l*3 + c) = line[k][l][c];
+
+            // Transform the pixel
+            currPixel -= means;
+            currPixel = transformation * currPixel + means + offset;
+
+            // Save the data for later scaling
+            for (int l=0; l<currPixel.size(); l+=3)
             {
-                for (int j=0; j<3; j++)
-                    currPixel(j) = line[k][im][j];
-
-                currPixel -= means;
-                currPixel = transformation * currPixel + means + offset;
-
-                for (int j=0; j<3; j++)
+                for (int c=0; c<3; c++)
                 {
-                    dstretched[im].push_back(currPixel[j]);
-                    mins[im][j] = std::min<int>(mins[im][j], currPixel[j]);
-                    maxs[im][j] = std::max<int>(maxs[im][j], currPixel[j]);
+                    dstretched[l/3].push_back(currPixel(l + c));
+                    mins[l/3][c] = std::min<int>(mins[l/3][c], currPixel(l + c));
+                    maxs[l/3][c] = std::max<int>(maxs[l/3][c], currPixel(l + c));
                 }
             }
         }
 
-        if (i % 10 == 0)
+        if (i % 100 == 0)
             progressed("Transforming...", (i * 100) / height);
     }
 
     qDebug() << "Out files: " << QString(output + "/img_%1.jpg").arg(1).toStdString().c_str();
 
-    for (int im=0; im<set.images.size(); im++)
+    for (int im=0; im<nImages; im++)
     {
         for (int k=0; k<dstretched[im].size(); k++)
         {
@@ -321,7 +354,7 @@ inline void dstretchSet(QString inputFolder, QString output, int minSamples, std
         }
 
         encoders[im].encode(dstretchedBytes[im].data(), width, height, (inputFolder + "/" + set.images[im]).toStdString().c_str());
-        progressed("Scaling...", (im * 100) / set.images.size());
+        progressed("Scaling...", (im * 100) / nImages);
     }
 }
 
